@@ -132,28 +132,6 @@ def update_ema_variables(model, ema_model, alpha, global_step):
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
 
-
-def compute_class_priors(pseudo_labels, num_classes):
-    """
-    计算各类别先验概率：(伪标签中属于该类的像素数) / 总像素数
-
-    参数:
-        pseudo_labels: [N, H, W] 伪标签矩阵（值为0~K-1的整数）
-        num_classes: 类别数K
-    返回:
-        class_priors: [K] 各类别先验概率
-    """
-    # 统计各类像素数
-    class_counts = torch.bincount(pseudo_labels, minlength=num_classes)
-
-    # 计算概率（避免除零）
-    total_pixels = pseudo_labels.numel()
-    priors = class_counts.float() / (total_pixels + 1e-6)
-
-    # 归一化确保总和为1
-    return priors / (priors.sum() + 1e-6)
-
-
 def train(args, snapshot_path):
     # os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     base_lr = args.base_lr
