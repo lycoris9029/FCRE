@@ -6,7 +6,6 @@ from datetime import datetime
 from collections import Counter
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from tensorboardX import SummaryWriter
@@ -14,15 +13,14 @@ from torch.nn.modules.loss import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from utils_.losses import ConLoss,PL_loss, DR_loss
-from config import get_config
-import math
+import torch.backends.cudnn as cudnn
+import time
 from dataset import (
     BaseDataSets,
     CTATransform,
     RandomGenerator,
     TwoStreamBatchSampler,
     WeakStrongAugment,
-    RandomGenerator_w,
 )
 from networks.net_factory import net_factory
 from utils_ import losses, metrics, ramps, util,feature_memory
@@ -34,18 +32,18 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
                     default='data/ACDC', help='Name of Experiment')
 parser.add_argument('--exp', type=str,
-                    default='ACDC_new/JointCPS', help='experiment_name')
+                    default='ACDC_new/FCRE', help='experiment_name')
 parser.add_argument('--model', type=str,
                     default='unet_F', help='model_name')
 parser.add_argument('--max_iterations', type=int,
-                    default=50000, help='maximum iteration number to train')
-parser.add_argument('--batch_size', type=int, default=2,
+                    default=30000, help='maximum iteration number to train')
+parser.add_argument('--batch_size', type=int, default=24,
                     help='batch_size per gpu')
 parser.add_argument('--deterministic', type=int, default=1,
                     help='whether use deterministic training')
 parser.add_argument('--base_lr', type=float, default=0.01,
                     help='segmentation network learning rate')
-parser.add_argument('--patch_size', type=list, default=[224, 224],
+parser.add_argument('--patch_size', type=list, default=[256, 256],
                     help='patch size of network input')
 parser.add_argument('--seed', type=int, default=1337, help='random seed')
 parser.add_argument('--num_classes', type=int, default=4,
@@ -61,9 +59,9 @@ parser.add_argument(
     help="confidence threshold for using pseudo-labels",
 )
 # label and unlabel
-parser.add_argument('--labeled_bs', type=int, default=1,
+parser.add_argument('--labeled_bs', type=int, default=12,
                     help='labeled_batch_size per epoch')
-parser.add_argument('--labeled_num', type=int, default=3,
+parser.add_argument('--labeled_num', type=int, default=7,
                     help='labeled data')
 # costs
 parser.add_argument('--ema_decay', type=float, default=0.999, help='ema_decay')
@@ -104,7 +102,6 @@ parser.add_argument('--throughput', action='store_true',
                     help='Test throughput only')
 
 args = parser.parse_args()
-config = get_config(args)
 
 
 def patients_to_slices(dataset, patiens_num):
@@ -129,6 +126,68 @@ def get_current_consistency_weight(consistency, epoch):
 
 
 
+def update_ema_variables(model, ema_model, alpha, global_step):
+    # Use the true average until the exponential average is more correct
+    alpha = min(1 - 1 / (global_step + 1), alpha)
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
+
+
+def compute_class_priors(pseudo_labels, num_classes):
+    """
+    计算各类别先验概率：(伪标签中属于该类的像素数) / 总像素数
+
+    参数:
+        pseudo_labels: [N, H, W] 伪标签矩阵（值为0~K-1的整数）
+        num_classes: 类别数K
+    返回:
+        class_priors: [K] 各类别先验概率
+    """
+    # 统计各类像素数
+    class_counts = torch.bincount(pseudo_labels, minlength=num_classes)
+
+    # 计算概率（避免除零）
+    total_pixels = pseudo_labels.numel()
+    priors = class_counts.float() / (total_pixels + 1e-6)
+
+    # 归一化确保总和为1
+    return priors / (priors.sum() + 1e-6)
+
+
+def train(args, snapshot_path):
+    # os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+    base_lr = args.base_lr
+    num_classes = args.num_classes
+    batch_size = args.batch_size
+    max_iterations = args.max_iterations
+    intra_loss = losses.GaussianPosteriorPullLoss()
+    #     loss_type = 'MT_loss'
+    def power_law_sharpening(tensor, gamma=0.99):
+        """
+        实现公式: Y'_j = (Y_j^gamma) / (Y_j^gamma + (1-Y_j)^gamma)
+        适用于torch.Tensor格式，维度为(B,C,H,W)
+
+        参数:
+            tensor: 输入张量，维度为(B,C,H,W)，值域应在[0,1]之间
+            gamma: 幂指数，默认为0.5
+
+        返回:
+            锐化后的张量，同样维度为(B,C,H,W)
+        """
+        # 确保输入值在[0,1]之间
+        tensor = torch.clamp(tensor, 0, 1)
+
+        # 计算分子
+        numerator = torch.pow(tensor, gamma)
+
+        # 计算分母
+        denominator = torch.pow(tensor, gamma) + torch.pow(1 - tensor, gamma)
+
+        # 应用变换
+        sharpened = numerator / denominator
+
+        return sharpened
+
     def create_model(net_type,in_ch,ema=False):
         # Network definition
         model = net_factory(net_type=net_type, in_chns=in_ch,
@@ -149,6 +208,74 @@ def get_current_consistency_weight(consistency, epoch):
     def worker_init_fn(worker_id):
         random.seed(args.seed + worker_id)
 
+    def get_comp_loss(weak, strong):
+        """get complementary loss and adaptive sample weight.
+        Compares least likely prediction (from strong augment) with argmin of weak augment.
+        Args:
+            weak (batch): weakly augmented batch
+            strong (batch): strongly augmented batch
+        Returns:
+            comp_loss, as_weight
+        """
+        il_output = torch.reshape(
+            strong,
+            (
+                args.batch_size,
+                args.num_classes,
+                args.patch_size[0] * args.patch_size[1],
+            ),
+        )
+        # calculate entropy for image-level preds (tensor of length labeled_bs)
+        as_weight = 1 - (Categorical(probs=il_output).entropy() / np.log(args.patch_size[0] * args.patch_size[1]))
+        # batch level average of entropy
+        as_weight = torch.mean(as_weight)
+        # complementary loss
+        comp_labels = torch.argmin(weak.detach(), dim=1, keepdim=False)
+        comp_loss = as_weight * ce_loss(
+            torch.add(torch.negative(strong), 1),
+            comp_labels,
+        )
+        return comp_loss, as_weight
+
+    def make_entropy(tensor):
+        b,c,h,w = tensor.size(0),tensor.size(1),tensor.size(2) ,tensor.size(3)
+        # prob_tensor = F.softmax(tensor,dim=1)
+        prob_tensor = tensor
+        entropy = -torch.sum(prob_tensor * torch.log2(prob_tensor + 1e-10),dim=1)
+
+        return entropy
+
+    def get_feature(features, mask):
+        b, c, h, w = features.shape
+        selected_features = features.permute(0, 2,3,1)[mask]  # N,dim
+        return selected_features
+
+    def compute_maximization_loss(mu):
+        """
+        计算最大化损失 L_max。
+        参数:
+            mu (Tensor): 形状为 (K, D) 的张量，K为类别数，D为均值向量的维度。
+        返回:
+            Tensor: 标量损失值。
+        """
+        K = mu.size(0)
+        if K < 2:
+            return torch.tensor(0.0, device=mu.device)
+
+        # 计算所有成对差值 (K, K, D)
+        diff = mu.unsqueeze(1) - mu.unsqueeze(0)
+        # 计算平方距离 (K, K)
+        sq_dist = torch.sum(diff ** 2, dim=2)
+        # 应用指数函数
+        exp_terms = torch.exp(-sq_dist)
+
+        # 排除对角线元素（k ≠ σ）
+        mask = ~torch.eye(K, dtype=torch.bool, device=mu.device)
+        valid_terms = exp_terms[mask]
+
+        # 计算损失值
+        loss = (2.0 / (K * (K - 1))) * valid_terms.sum()
+        return loss
 
     def refresh_policies(db_train, cta, random_depth_weak, random_depth_strong):
         db_train.ops_weak = cta.policy(probe=False, weak=True)
@@ -238,6 +365,10 @@ def get_current_consistency_weight(consistency, epoch):
     v_loss_seg_dice_mean = []
     epoch_number = []
     for epoch_num in iterator:
+        # ====== epoch timing & memory ======
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        epoch_start_time = time.time()
         r_loss_seg_dice_total = 0.0
         v_loss_seg_dice_total = 0.0
         a1 = 0.01
@@ -261,12 +392,11 @@ def get_current_consistency_weight(consistency, epoch):
         running_con_l_u = 0
         running_con_loss = 0
         for i_batch, sampled_batch in enumerate(zip(trainloader)):
-            raw_batch, weak_batch, strong_batch, label_batch_aug, label_batch = (
-                sampled_batch[0]["image"],
+            weak_batch, strong_batch, label_batch_aug= (
                 sampled_batch[0]["image_weak"],
                 sampled_batch[0]["image_strong"],
                 sampled_batch[0]["label_aug"],
-                sampled_batch[0]["label"],
+
             )
 
             label_batch_aug[label_batch_aug >= 4] = 0
@@ -278,7 +408,7 @@ def get_current_consistency_weight(consistency, epoch):
             )
 
             # handle unfavorable cropping
-            non_zero_ratio = torch.count_nonzero(label_batch) / (24 * 224 * 224)
+            non_zero_ratio = torch.count_nonzero(label_batch_aug) / (24 * 224 * 224)
             # non_zero_ratio = 0.001
             non_zero_ratio_aug = torch.count_nonzero(label_batch_aug) / (24 * 224 * 224)
             #             print(label_batch.unique(return_counts=True))
@@ -290,13 +420,13 @@ def get_current_consistency_weight(consistency, epoch):
             # outputs for model
             outputs_weak1_logits,features1 = model1(weak_batch)
             outputs_weak_soft1 = torch.softmax(outputs_weak1_logits, dim=1)
-            outputs_strong1,feature1_strong = model1(strong_batch)
-            outputs_strong_soft1 = torch.softmax(outputs_strong1, dim=1)
+            # outputs_strong1,feature1_strong = model1(strong_batch)
+            # outputs_strong_soft1 = torch.softmax(outputs_strong1, dim=1)
 
             outputs_weak2_logits,features2 = model2(weak_batch)
             outputs_weak_soft2 = torch.softmax(outputs_weak2_logits, dim=1)
-            outputs_strong2,feature2_strong = model2(strong_batch)
-            outputs_strong_soft2 = torch.softmax(outputs_strong2, dim=1)
+            # outputs_strong2,feature2_strong = model2(strong_batch)
+            # outputs_strong_soft2 = torch.softmax(outputs_strong2, dim=1)
             #################################################################################################################################
             # supervised loss
             sup_loss1 = dice_loss(
@@ -317,12 +447,12 @@ def get_current_consistency_weight(consistency, epoch):
 
             center1, counts1, var1 = make_prototype_center_all_cross_attention(features1[:args.labeled_bs],
                                                                label_batch_aug[:args.labeled_bs], num_classes,
-                                                               memory_bank_label1,memory_bank_label2)
+                                                               memory_bank_label1)
 
 
             center2, counts2, var2 = make_prototype_center_all_cross_attention(features2[:args.labeled_bs],
                                                                label_batch_aug[:args.labeled_bs], num_classes,
-                                                               memory_bank_label2,memory_bank_label1)
+                                                               memory_bank_label2)
 
 
 
@@ -332,11 +462,13 @@ def get_current_consistency_weight(consistency, epoch):
 
             post1,prob1 = find_uncertain_positions(features1[args.labeled_bs:],center2,var2)  #5,224,224
             post2,prob2 = find_uncertain_positions(features2[args.labeled_bs:],center1,var1)  #5,224,224
-            margin_loss = asymmetric_kl_consistency_loss(outputs_weak_soft1[args.labeled_bs:],outputs_weak_soft2[args.labeled_bs:],prob1,prob2)
+            m1 = prob1.detach()
+            m2 = prob2.detach()
+            margin_loss = asymmetric_kl_consistency_loss(outputs_weak_soft1[args.labeled_bs:],outputs_weak_soft2[args.labeled_bs:],m1,m2,prob1,prob2)
             loss_consistency = margin_loss
 
-            unsupervised_loss1 = dice_loss(outputs_weak_soft2[args.labeled_bs:],pseudo_label1.unsqueeze(1),margin=prob1) + ACE_loss(outputs_weak2_logits[args.labeled_bs:],pseudo_label1,margin=prob1)
-            unsupervised_loss2 = dice_loss(outputs_weak_soft1[args.labeled_bs:],pseudo_label2.unsqueeze(1),margin=prob2) + ACE_loss(outputs_weak1_logits[args.labeled_bs:],pseudo_label2,margin=prob2)
+            unsupervised_loss1 = dice_loss(outputs_weak_soft2[args.labeled_bs:],pseudo_label1.unsqueeze(1),margin=m1)
+            unsupervised_loss2 = dice_loss(outputs_weak_soft1[args.labeled_bs:],pseudo_label2.unsqueeze(1),margin=m2)
             loss_mwcps = unsupervised_loss1 + unsupervised_loss2
 
             unreliable_region1 = unreliable_map(post1,outputs_weak_soft1[args.labeled_bs:])
@@ -344,7 +476,7 @@ def get_current_consistency_weight(consistency, epoch):
             intra_loss1 = margin_based_uncertainty_loss(features1[args.labeled_bs:],post1,prob1,unreliable_region1,center1)
             intra_loss2 = margin_based_uncertainty_loss(features2[args.labeled_bs:],post2,prob2,unreliable_region2,center2)
             intra_loss_total = intra_loss1 + intra_loss2
-            print(intra_loss_total.item())
+            # print(intra_loss_total.item())
 
 
             if iter_num < 0:
@@ -356,7 +488,24 @@ def get_current_consistency_weight(consistency, epoch):
                 consistency_weight1 = get_current_consistency_weight(args.consistency1,
                                                                      iter_num // 150)
 
-            
+            # both
+            #             loss = sup_loss + consistency_weight1 * (Loss_contrast_l + unsup_loss + consistency_weight2 *  Loss_contrast_u)
+            loss = supervised_loss + var_loss * consistency_weight2 * 0.05 + loss_mwcps * consistency_weight1 + intra_loss_total * consistency_weight2 + 0.05
+            # loss = supervised_loss + var_loss * consistency_weight2 + consistency_weight2 * loss_consistency + unsupervised_loss * consistency_weight2
+            # print(ambiguity1_features.shape,ambiguity2_features.shape)
+            # print(intra_loss1.item(),intra_loss2.item())
+
+            #             loss = 0.5 * (sup_loss + consistency_weight2 * unsup_loss + consistency_weight2 * contrastive_loss)
+            # make_dot(loss,params=dict(model1.named_parameters())).render('model1',format="png")
+
+            # running_loss += loss
+            # running_sup_loss += sup_loss
+            # running_unsup_loss += unsup_loss
+            # #             running_comple_loss += comple_loss
+            # running_con_loss += contrastive_loss
+            # running_con_l_l += Loss_contrast_l
+            # running_con_l_u += Loss_contrast_u
+
             optimizer1.zero_grad()
             optimizer2.zero_grad()
 
@@ -396,10 +545,10 @@ def get_current_consistency_weight(consistency, epoch):
                 image_strong = strong_batch[idx, 0:1, :, :]
                 writer.add_image("train/StrongImage", image_strong, iter_num)
                 # show model prediction (strong augment)
-                outputs_strong1 = torch.argmax(outputs_strong_soft1, dim=1, keepdim=True)
-                writer.add_image("train/model_Prediction1", outputs_strong1[idx, ...] * 50, iter_num)
-                outputs_strong2 = torch.argmax(outputs_strong_soft2, dim=1, keepdim=True)
-                writer.add_image("train/model_Prediction2", outputs_strong2[idx, ...] * 50, iter_num)
+                # outputs_strong1 = torch.argmax(outputs_strong_soft1, dim=1, keepdim=True)
+                # writer.add_image("train/model_Prediction1", outputs_strong1[idx, ...] * 50, iter_num)
+                # outputs_strong2 = torch.argmax(outputs_strong_soft2, dim=1, keepdim=True)
+                # writer.add_image("train/model_Prediction2", outputs_strong2[idx, ...] * 50, iter_num)
                 # show ground truth label
                 labs = label_batch_aug[idx, ...].unsqueeze(0) * 50
                 writer.add_image("train/GroundTruth", labs, iter_num)
@@ -496,7 +645,11 @@ def get_current_consistency_weight(consistency, epoch):
                                                           iter_num, round(best_performance2, 4))))
                         util.save_checkpoint(epoch_num, model2, optimizer2, loss, save_mode_path)
                         util.save_checkpoint(epoch_num, model2, optimizer2, loss, save_best)
-
+                        # util.save_checkpoint(epoch_num, projector_5, optimizer1, loss, path=save_proj)
+                        # util.save_checkpoint(epoch_num, model2, optimizer2, projector_2, projector_4, cta,
+                        #                      best_performance2, save_mode_path)
+                        # util.save_checkpoint(epoch_num, model2, optimizer2, projector_2, projector_4, cta,
+                        #                      best_performance2, save_best)
 
                 logging.info(
                     'iteration %d : model2_mean_dice : %f model2_mean_hd95 : %f' % (iter_num, performance2, mean_hd952))
@@ -504,16 +657,56 @@ def get_current_consistency_weight(consistency, epoch):
                 logging.info(
                     'current best dice coef model 1 {}, model 2 {}'.format(best_performance1, best_performance2))
 
-            
+            if iter_num % 3000 == 0:
+                save_mode_path = os.path.join(
+                    snapshot_path, 'model1_iter_' + str(iter_num) + '.pth')
+
+                #                 util.save_checkpoint(epoch_num, model1, optimizer1, loss, save_mode_path)
+                # util.save_checkpoint(epoch_num, model1, optimizer1, projector_1, projector_3, cta, best_performance1,
+                #                      save_mode_path)
+                logging.info("save model1 to {}".format(save_mode_path))
+
+                save_mode_path = os.path.join(
+                    snapshot_path, 'model2_iter_' + str(iter_num) + '.pth')
+
+                #                 util.save_checkpoint(epoch_num, model2, optimizer2, loss, save_mode_path)
+                # util.save_checkpoint(epoch_num, model2, optimizer2, projector_2, projector_4, cta, best_performance2,
+                #                      save_mode_path)
+                logging.info("save model2 to {}".format(save_mode_path))
+
             if iter_num >= max_iterations:
                 break
         r_loss_seg_dice_mean.append(r_loss_seg_dice_total / len(trainloader))
         v_loss_seg_dice_mean.append(v_loss_seg_dice_total / len(trainloader))
-
+        # epoch_number.append(epoch_num)
+        # if epoch_num == 50:
+        #     plt.plot(epoch_number, r_loss_seg_dice_mean, label='net1_loss')
+        #     plt.plot(epoch_number, v_loss_seg_dice_mean,label='net2_loss')
+        #     plt.xlabel("epoch")
+        #     plt.ylabel("los")
+        #     plt.legend()
+        #     plt.savefig("with_competition.png", format="png", dpi=300)
         if iter_num >= max_iterations:
             iterator.close()
             break
+        # ====== epoch timing & memory (end) ======
+        torch.cuda.synchronize()
+        epoch_time = time.time() - epoch_start_time
 
+        max_mem_alloc = torch.cuda.max_memory_allocated() / 1024**2
+        max_mem_resv  = torch.cuda.max_memory_reserved()  / 1024**2
+
+        logging.info(
+            f"[Epoch {epoch_num}] "
+            f"Time: {epoch_time:.2f}s | "
+            f"GPU Mem: {max_mem_alloc:.1f}MB (alloc), {max_mem_resv:.1f}MB (reserved)"
+        )
+
+        print(
+            f"[Epoch {epoch_num}] "
+            f"Time: {epoch_time:.2f}s | "
+            f"GPU Mem: {max_mem_alloc:.1f}MB (alloc), {max_mem_resv:.1f}MB (reserved)"
+        )
         epoch_loss = running_loss / len(trainloader)
         epoch_sup_loss = running_sup_loss / len(trainloader)
         epoch_unsup_loss = running_unsup_loss / len(trainloader)
@@ -560,6 +753,7 @@ def get_current_consistency_weight(consistency, epoch):
 
 
 if __name__ == "__main__":
+    import sys
     if not args.deterministic:
         cudnn.benchmark = True
         cudnn.deterministic = False
@@ -573,10 +767,10 @@ if __name__ == "__main__":
     snapshot_path = "model/{}_{}_labeled/{}".format(args.exp, args.labeled_num, args.model)
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
-    if os.path.exists(snapshot_path + '/code'):
-        shutil.rmtree(snapshot_path + '/code')
-    shutil.copytree('.', snapshot_path + '/code', shutil.ignore_patterns(['.git', '__pycache__']))
-    
+    # if os.path.exists(snapshot_path + '/code'):
+    #     shutil.rmtree(snapshot_path + '/code')
+    # shutil.copytree('.', snapshot_path + '/code', shutil.ignore_patterns(['.git', '__pycache__']))
+
     logging.basicConfig(filename=snapshot_path + "/log.txt", level=logging.INFO,
                         format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
